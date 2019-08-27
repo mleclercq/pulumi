@@ -19,15 +19,19 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/blang/semver"
 	pbempty "github.com/golang/protobuf/ptypes/empty"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 
+	"github.com/pulumi/pulumi/pkg/resource"
 	"github.com/pulumi/pulumi/pkg/resource/config"
+	"github.com/pulumi/pulumi/pkg/resource/deploy/providers"
 	"github.com/pulumi/pulumi/pkg/resource/plugin"
 	"github.com/pulumi/pulumi/pkg/tokens"
 	"github.com/pulumi/pulumi/pkg/util/contract"
+	"github.com/pulumi/pulumi/pkg/util/logging"
 	"github.com/pulumi/pulumi/pkg/util/result"
 	"github.com/pulumi/pulumi/pkg/util/rpcutil"
 	pulumirpc "github.com/pulumi/pulumi/sdk/proto/go"
@@ -41,18 +45,25 @@ type QuerySource interface {
 
 // NewQuerySource creates a `QuerySource` for some target runtime environment specified by
 // `runinfo`, and supported by language plugins provided in `plugctx`.
-func NewQuerySource(ctx context.Context, plugctx *plugin.Context, client BackendClient,
-	runinfo *EvalRunInfo) (QuerySource, error) {
+func NewQuerySource(cancel context.Context, plugctx *plugin.Context, client BackendClient,
+	runinfo *EvalRunInfo, defaultProviderVersions map[tokens.Package]*semver.Version,
+	provs ProviderSource) (QuerySource, error) {
 
 	// Create a new builtin provider. This provider implements features such as `getStack`.
 	builtins := newBuiltinProvider(client)
+
+	reg, err := providers.NewRegistry(plugctx.Host, nil, false, builtins)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to start resource monitor")
+	}
 
 	// First, fire up a resource monitor that will disallow all resource operations, as well as
 	// service calls for things like resource ouptuts of state snapshots.
 	//
 	// NOTE: Using the queryResourceMonitor here is *VERY* important, as its job is to disallow
 	// resource operations in query mode!
-	mon, err := newQueryResourceMonitor(builtins, opentracing.SpanFromContext(ctx))
+	mon, err := newQueryResourceMonitor(builtins, defaultProviderVersions, provs, reg, plugctx,
+		opentracing.SpanFromContext(cancel))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to start resource monitor")
 	}
@@ -64,7 +75,7 @@ func NewQuerySource(ctx context.Context, plugctx *plugin.Context, client Backend
 		runinfo:       runinfo,
 		runLangPlugin: runLangPlugin,
 		finChan:       make(chan result.Result),
-		cancel:        ctx,
+		cancel:        cancel,
 	}
 
 	// Now invoke Run in a goroutine.  All subsequent resource creation events will come in over the gRPC channel,
@@ -177,15 +188,52 @@ func runLangPlugin(src *querySource) result.Result {
 
 // newQueryResourceMonitor creates a new resource monitor RPC server intended to be used in Pulumi's
 // "query mode".
-func newQueryResourceMonitor(builtins *builtinProvider, tracingSpan opentracing.Span) (*queryResmon, error) {
+func newQueryResourceMonitor(
+	builtins *builtinProvider, defaultProviderVersions map[tokens.Package]*semver.Version,
+	provs ProviderSource, reg *providers.Registry, plugctx *plugin.Context, tracingSpan opentracing.Span) (*queryResmon, error) {
 
 	// Create our cancellation channel.
 	cancel := make(chan bool)
 
+	// Create channel for handling registrations.
+	regChan := make(chan *registerResourceEvent)
+
+	// Create a new default provider manager.
+	var config *Target
+	d := &defaultProviders{
+		defaultVersions: defaultProviderVersions,
+		providers:       make(map[string]providers.Reference),
+		config:          config,
+		requests:        make(chan defaultProviderRequest),
+		regChan:         regChan,
+		cancel:          cancel,
+	}
+
+	go func() {
+		for {
+			select {
+			case e := <-regChan:
+				urn := resource.NewURN(
+					"query-stack", "query-project", "parent-type", e.goal.Type, e.goal.Name)
+
+				inputs, _, _ := reg.Check(urn, resource.PropertyMap{}, e.goal.Properties, false)
+				_, _, _, _ = reg.Create(urn, inputs, 9999)
+
+				e.done <- &RegisterResult{State: &resource.State{
+					Type: e.goal.Type,
+					URN:  urn,
+				}}
+			}
+		}
+	}()
+
 	// New up an engine RPC server.
 	queryResmon := &queryResmon{
-		builtins: builtins,
-		cancel:   cancel,
+		builtins:         builtins,
+		providers:        provs,
+		defaultProviders: d,
+		cancel:           cancel,
+		reg:              reg,
 	}
 
 	// Fire up a gRPC server and start listening for incomings.
@@ -202,6 +250,8 @@ func newQueryResourceMonitor(builtins *builtinProvider, tracingSpan opentracing.
 	queryResmon.addr = fmt.Sprintf("127.0.0.1:%d", port)
 	queryResmon.done = done
 
+	go d.serve()
+
 	return queryResmon, nil
 }
 
@@ -213,10 +263,13 @@ func newQueryResourceMonitor(builtins *builtinProvider, tracingSpan opentracing.
 // 2. Services requests for stack snapshots. This is primarily to allow us to allow queries across
 //    stack snapshots.
 type queryResmon struct {
-	builtins *builtinProvider // provides builtins such as `getStack`.
-	addr     string           // the address the host is listening on.
-	cancel   chan bool        // a channel that can cancel the server.
-	done     chan error       // a channel that resolves when the server completes.
+	builtins         *builtinProvider    // provides builtins such as `getStack`.
+	providers        ProviderSource      // the provider source itself.
+	defaultProviders *defaultProviders   // the default provider manager.
+	addr             string              // the address the host is listening on.
+	cancel           chan bool           // a channel that can cancel the server.
+	done             chan error          // a channel that resolves when the server completes.
+	reg              *providers.Registry // registry for resource providers.
 }
 
 var _ SourceResourceMonitor = (*queryResmon)(nil)
@@ -238,9 +291,13 @@ func (rm *queryResmon) Invoke(ctx context.Context, req *pulumirpc.InvokeRequest)
 	tok := tokens.ModuleMember(req.GetTok())
 	label := fmt.Sprintf("QueryResourceMonitor.Invoke(%s)", tok)
 
-	// Fail on all calls to `Invoke` except this one.
-	if tok != readStackResourceOutputs {
-		return nil, fmt.Errorf("Query mode does not support invoke call for operation '%s'", tok)
+	providerReq, err := rm.parseProviderRequest(tok.Package(), req.GetVersion())
+	if err != nil {
+		return nil, err
+	}
+	prov, err := rm.getProvider(providerReq, req.GetProvider())
+	if err != nil {
+		return nil, err
 	}
 
 	args, err := plugin.UnmarshalProperties(
@@ -249,12 +306,12 @@ func (rm *queryResmon) Invoke(ctx context.Context, req *pulumirpc.InvokeRequest)
 		return nil, errors.Wrapf(err, "failed to unmarshal %v args", tok)
 	}
 
-	// Dispatch request for resource outputs to builtin provider.
-	ret, failures, err := rm.builtins.Invoke(tok, args)
+	// Do the invoke and then return the arguments.
+	logging.V(5).Infof("ResourceMonitor.Invoke received: tok=%v #args=%v", tok, len(args))
+	ret, failures, err := prov.Invoke(tok, args)
 	if err != nil {
-		return nil, errors.Wrapf(err, "invoke %s failed", tok)
+		return nil, errors.Wrapf(err, "invocation of %v returned an error", tok)
 	}
-
 	mret, err := plugin.MarshalProperties(ret, plugin.MarshalOptions{Label: label, KeepUnknowns: true})
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to marshal return")
@@ -301,4 +358,56 @@ func (rm *queryResmon) SupportsFeature(ctx context.Context,
 	return &pulumirpc.SupportsFeatureResponse{
 		HasSupport: hasSupport,
 	}, nil
+}
+
+func (rm *queryResmon) parseProviderRequest(pkg tokens.Package, version string) (providers.ProviderRequest, error) {
+	if version == "" {
+		logging.V(5).Infof("parseProviderRequest(%s): semver version is the empty string", pkg)
+		return providers.NewProviderRequest(nil, pkg), nil
+	}
+
+	parsedVersion, err := semver.Parse(version)
+	if err != nil {
+		logging.V(5).Infof("parseProviderRequest(%s, %s): semver version string is invalid: %v", pkg, version, err)
+		return providers.ProviderRequest{}, err
+	}
+
+	return providers.NewProviderRequest(&parsedVersion, pkg), nil
+}
+
+// getProviderReference fetches the provider reference for a resource, read, or invoke from the
+// given package with the given unparsed provider reference. If the unparsed provider reference is
+// empty, this function returns a reference to the default provider for the indicated package.
+func (rm *queryResmon) getProviderReference(req providers.ProviderRequest,
+	rawProviderRef string) (providers.Reference, error) {
+	if rawProviderRef != "" {
+		ref, err := providers.ParseReference(rawProviderRef)
+		if err != nil {
+			return providers.Reference{}, errors.Errorf("could not parse provider reference: %v", err)
+		}
+		return ref, nil
+	}
+
+	ref, err := rm.defaultProviders.getDefaultProviderRef(req)
+	if err != nil {
+		return providers.Reference{}, err
+	}
+	return ref, nil
+}
+
+// getProvider fetches the provider plugin for a resource, read, or invoke from the given package
+// with the given unparsed provider reference. If the unparsed provider reference is empty, this
+// function returns the plugin for the indicated package's default provider.
+func (rm *queryResmon) getProvider(
+	req providers.ProviderRequest, rawProviderRef string) (plugin.Provider, error) {
+
+	providerRef, err := rm.getProviderReference(req, rawProviderRef)
+	if err != nil {
+		return nil, err
+	}
+	provider, ok := rm.reg.GetProvider(providerRef)
+	if !ok {
+		return nil, errors.Errorf("unknown provider '%v'", rawProviderRef)
+	}
+	return provider, nil
 }
